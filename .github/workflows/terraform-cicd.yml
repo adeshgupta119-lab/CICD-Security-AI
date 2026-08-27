@@ -1,0 +1,287 @@
+name: Terraform CI/CD
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "**.tf"
+      - "**.tfvars"
+      - ".github/workflows/terraform-cicd.yml"
+      - "scripts/**"
+
+permissions:
+  contents: write 
+  pull-requests: write
+  id-token: write
+
+env:
+  TF_VERSION: "1.9.5"
+  TF_IN_AUTOMATION: "true"
+  ARM_USE_OIDC: "true"
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  feature-branch-plan:
+    name: Feature Branch - Plan & Self-Heal
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 
+          token: ${{ secrets.PAT_TOKEN || github.token }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tfsec
+        run: curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Auto-format
+        id: fmt
+        run: |
+          terraform fmt -recursive
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit formatting fix and stop
+        if: steps.fmt.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: terraform fmt [ai-autofix]"
+          git push
+          echo "::notice::Formatting fixed and pushed. Pipeline will re-run automatically."
+
+      - name: Terraform init
+        if: steps.fmt.outputs.changed == 'false'
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TFSTATE_CONTAINER }}" \
+            -backend-config="key=resource-group/terraform.tfstate"
+
+      - name: Quality gate (validate + tflint + tfsec + trivy + plan)
+        if: steps.fmt.outputs.changed == 'false'
+        id: gate
+        run: |
+          chmod +x scripts/quality_gate.sh
+          if scripts/quality_gate.sh; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Infinite Retry Setup (Loop Guard Removed)
+      - name: AI autofix (Continuous Retry)
+        if: steps.fmt.outputs.changed == 'false' && steps.gate.outputs.passed == 'false'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if python3 scripts/ai_autofix.py quality_gate_error.log; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -F ai_fix_explanation.md
+            git push
+            echo "::notice::AI pushed a fix. Pipeline will re-run automatically to check if it worked."
+          else
+            echo "::error::AI could not determine a fix. Manual intervention needed."
+            cat quality_gate_error.log
+            exit 1
+          fi
+
+      - name: AI plan review (Gemini)
+        if: steps.fmt.outputs.changed == 'false' && steps.gate.outputs.passed == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 scripts/ai_review.py
+
+      - name: Build PR body
+        if: steps.fmt.outputs.changed == 'false' && steps.gate.outputs.passed == 'true'
+        run: |
+          {
+            cat ai_summary.md
+            echo ""
+            echo "<details><summary>Terraform Plan output</summary>"
+            echo ""
+            echo '```'
+            cat plan_output.txt
+            echo '```'
+            echo "</details>"
+            echo ""
+            if [ -f tfsec_output.txt ]; then
+              echo "<details><summary>TFSec output</summary>"
+              echo ""
+              echo '```'
+              cat tfsec_output.txt
+              echo '```'
+              echo "</details>"
+            fi
+          } > pr_body.md
+
+      - name: AI opens or updates the PR
+        if: steps.fmt.outputs.changed == 'false' && steps.gate.outputs.passed == 'true'
+        run: |
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          EXISTING=$(gh pr list --base main --head "$BRANCH" --state open --json number --jq '.[0].number' || true)
+          if [[ -z "$EXISTING" ]]; then
+            gh pr create --base main --head "$BRANCH" \
+              --title "Terraform change: $BRANCH" \
+              --body-file pr_body.md
+            echo "::notice::AI opened a new PR into main."
+          else
+            gh pr comment "$EXISTING" --body-file pr_body.md
+            echo "::notice::Updated existing PR #$EXISTING with the latest plan."
+          fi
+
+  main-plan:
+    name: Main - Plan
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tfsec
+        run: curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TFSTATE_CONTAINER }}" \
+            -backend-config="key=resource-group/terraform.tfstate"
+
+      - name: Quality gate
+        id: gate
+        run: |
+          chmod +x scripts/quality_gate.sh
+          if scripts/quality_gate.sh; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: AI diagnosis (read-only, no fix) on failure
+        if: steps.gate.outputs.passed == 'false'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 scripts/ai_diagnose.py quality_gate_error.log "main branch plan"
+          cat diagnosis.md >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Upload plan artifact
+        if: steps.gate.outputs.passed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+          retention-days: 1
+
+  terraform-apply:
+    name: Terraform Apply
+    needs: main-plan
+    if: github.ref == 'refs/heads/main' && needs.main-plan.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: production 
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TFSTATE_CONTAINER }}" \
+            -backend-config="key=resource-group/terraform.tfstate"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+
+      - name: Terraform apply (approved plan)
+        id: apply
+        run: terraform apply -input=false -auto-approve tfplan 2> apply_error.log || (cat apply_error.log && exit 1)
+
+      - name: AI diagnosis on apply failure (read-only, no fix)
+        if: failure() && steps.apply.outcome == 'failure'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 scripts/ai_diagnose.py apply_error.log "terraform apply"
+          cat diagnosis.md >> "$GITHUB_STEP_SUMMARY"
