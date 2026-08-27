@@ -41,7 +41,8 @@ if [[ "$CRIT_COUNT" -gt 0 ]]; then
 fi
 
 echo "--- terraform plan ---"
-if ! terraform plan -input=false -out=tfplan -no-color > plan_run_output.txt 2>&1; then
+# Yahan maine flag wali error ke liye -var arguments add kiye hain
+if ! terraform plan -var="resource_group_name=myResourceGroup" -var="location=eastus" -input=false -out=tfplan -no-color > plan_run_output.txt 2>&1; then
   fail "terraform plan" plan_run_output.txt
 fi
 terraform show -no-color tfplan > plan_output.txt
